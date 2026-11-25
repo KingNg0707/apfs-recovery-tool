@@ -1,0 +1,21 @@
+# never commit recovered data
+*.img
+*.dmg
+*.raw
+*.tsv
+*.db
+*.db-wal
+*.db-shm
+apfs_magic_scan.txt
+
+# build artifacts (in case apfsprogs is cloned next to this repo)
+*.o
+*.a
+*.dSYM/
+apfsck/apfsck
+mkapfs/mkapfs
+
+# python / editor noise
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,642 @@
+From: <author>
+Subject: [PATCH] apfsck: data-recovery mode + catalog dumper (macOS build)
+
+Recovery-mode changes to apfsck for reading damaged APFS containers from raw
+disk images.  Based on upstream commit b9c4cb4 of https://github.com/linux-apfs/apfsprogs
+(GNU GPL-2.0 — this patch is a derivative work and must remain GPL-2.0).
+All recovery
+behavior is opt-in via environment variables; with none set, apfsck behaves
+as upstream.
+
+Knobs:
+  APFS_SOFT=1              report() prints problems but does not exit
+  APFS_RECOVERY=1          lenient key/inode/object checks
+  APFS_ALLOW_TRUNCATED=1   clamp s_block_count to the actual device size
+  APFS_SB_BLOCK=<block>    read container NXSB from block N (dec or 0x hex)
+                           instead of the standard location; use when the
+                           primary superblock was overwritten
+  APFS_DUMP=<file>         after parsing the volume snapshot, stream the
+                           catalog B-tree to <file> as TSV and exit(0),
+                           skipping the remaining fsck passes
+  APFS_DUMP_XID=<xid>      dump a specific snapshot xid instead of the newest
+
+Dump output columns (tab-separated):
+  I <cnid> <mode> <uncompressed_size> <btime> <mtime>
+  D <parent_cnid> <child_cnid> <drec_flags> <name(escaped: \\t \\n \\r \\\\ \\uXXXX)>
+  E <cnid> <logical_offset_bytes> <length_bytes> <flags> <phys_block_num>
+      (logical offset and length are BYTES; phys_block_num is an APFS block
+       number — multiply by the block size for the image byte offset. The E
+       records are the authoritative source for file sizes: inode
+       uncompressed_size is often 0 on recovered images.)
+
+compat/: small macOS-only shim. mmap() of sparse image regions fails with
+EINVAL on macOS; mmap_shim.h replaces mmap/munmap with calloc+pread for the
+apfsck read path only. WARNING: because pages are local copies, a binary
+built with this shim must never be used to write to the image.
+
+diff --git a/apfsck/apfsck.c b/apfsck/apfsck.c
+index d26d255..17dbefb 100644
+--- a/apfsck/apfsck.c
++++ b/apfsck/apfsck.c
+@@ -18,6 +18,7 @@ int fd_tier2 = -1;
+ unsigned int options;
+ static bool weird_state;
+ static char *progname;
++bool apfs_recovery_mode;	/* set from APFS_RECOVERY: lenient parsing for data recovery */
+ 
+ /**
+  * usage - Print usage information and exit
+@@ -52,13 +53,17 @@ __attribute__((noreturn)) void system_error(void)
+ }
+ 
+ /**
+- * report - Report the issue discovered and exit
++ * report - Report the issue discovered and exit (or continue if lenient)
+  * @context: structure where corruption was found (can be NULL)
+  * @message: format string with a short explanation
++ *
++ * If the environment variable APFS_SOFT is set, the report is printed but
++ * execution continues instead of exiting.  This makes it possible to run a
++ * full read-only pass over a badly corrupted filesystem and salvage whatever
++ * parses successfully.
+  */
+-__attribute__((noreturn, format(printf, 2, 3)))	void report(const char *context,
+-							    const char *message,
+-							    ...)
++void report(const char *context,
++	    const char *message, ...)
+ {
+ 	char buf[128];
+ 	va_list args;
+@@ -72,6 +77,10 @@ __attribute__((noreturn, format(printf, 2, 3)))	void report(const char *context,
+ 	else
+ 		printf("%s\n", buf);
+ 
++	if (getenv("APFS_SOFT")) {
++		fflush(stdout);
++		return;
++	}
+ 	exit(EXIT_FAILURE);
+ }
+ 
+@@ -125,6 +134,7 @@ int main(int argc, char *argv[])
+ 	char *filename;
+ 
+ 	progname = argv[0];
++	apfs_recovery_mode = getenv("APFS_RECOVERY") != NULL;
+ 	while (1) {
+ 		int opt = getopt(argc, argv, "cuvwF:");
+ 
+diff --git a/apfsck/apfsck.h b/apfsck/apfsck.h
+index 271820a..c6d6630 100644
+--- a/apfsck/apfsck.h
++++ b/apfsck/apfsck.h
+@@ -14,13 +14,14 @@ extern struct volume_superblock *vsb;	/* Volume superblock */
+ extern int fd_main;			/* File descriptor for the main device */
+ extern int fd_tier2;			/* File descriptor for the tier 2 device, if any */
+ extern bool ongoing_query;		/* Are we currently running a query? */
++extern bool apfs_recovery_mode;		/* Set from APFS_RECOVERY env: lenient parsing for data recovery */
+ 
+ /* Option flags */
+ #define	OPT_REPORT_CRASH	1 /* Report on-disk signs of a past crash */
+ #define OPT_REPORT_UNKNOWN	2 /* Report unknown or unsupported features */
+ #define OPT_REPORT_WEIRD	4 /* Report issues that may not be corruption */
+ 
+-extern __attribute__((noreturn, format(printf, 2, 3)))
++extern __attribute__((format(printf, 2, 3)))
+ 		void report(const char *context, const char *message, ...);
+ extern void report_crash(const char *context);
+ extern void report_unknown(const char *feature);
+diff --git a/apfsck/btree.c b/apfsck/btree.c
+index da06f9a..f328628 100644
+--- a/apfsck/btree.c
++++ b/apfsck/btree.c
+@@ -949,6 +949,13 @@ static void parse_subtree(struct node *root,
+ 		btree->key_count += root->records;
+ 	}
+ 	++btree->node_count;
++	if (btree->node_count % 100000 == 0) {
++		static const char *tn[] = {"?", "omap", "cat", "extref",
++			"snapmeta", "freeq", "snaps", "fext", "fusion"};
++		fprintf(stderr, "[progress] tree=%s nodes=%llu\n",
++			btree->type < 9 ? tn[btree->type] : "?",
++			(unsigned long long)btree->node_count);
++	}
+ 
+ 	if (btree_is_omap(btree) && !node_has_fixed_kv_size(root))
+ 		report("Object map", "key size should be fixed.");
+@@ -2091,3 +2098,151 @@ next_node:
+ 	}
+ 	goto next_node;
+ }
++
++/* ------------------------------------------------------------------
++ * Data-recovery extension: stream catalog records to a FILE.
++ * Read-only DFS over the catalog B-tree; emits TSV lines consumed by build_index.py:
++ *   I<TAB>cnid<TAB>mode<TAB>size<TAB>btime<TAB>mtime
++ *   D<TAB>parent_cnid<TAB>child_cnid<TAB>drec_flags<TAB>name(escaped)
++ * ------------------------------------------------------------------ */
++
++static void cat_dump_escape(FILE *out, const char *s, int len)
++{
++	int i;
++
++	for (i = 0; i < len; ++i) {
++		unsigned char c = (unsigned char)s[i];
++		switch (c) {
++		case '\t': fputs("\\t", out); break;
++		case '\n': fputs("\\n", out); break;
++		case '\r': fputs("\\r", out); break;
++		case '\\': fputs("\\\\", out); break;
++		default:
++			if (c < 0x20)
++				fprintf(out, "\\u%04x", c);
++			else
++				fputc(c, out);
++		}
++	}
++}
++
++static void cat_dump_node(struct node *node, FILE *out)
++{
++	struct btree *btree = node->btree;
++	static unsigned long long dump_nodes = 0;
++	int i;
++
++	if (++dump_nodes % 50000 == 0) {
++		fprintf(stderr, "[dump-progress] nodes=%llu\n", dump_nodes);
++		fflush(stderr);
++	}
++	for (i = 0; i < node->records; ++i) {
++		void *raw_key, *raw_val;
++		int off, len;
++
++		len = node_locate_key(node, i, &off);
++		raw_key = (char *)node->raw + off;
++		len = node_locate_data(node, i, &off);
++		raw_val = (char *)node->raw + off;
++
++		if (!node_is_leaf(node)) {
++			u64 child_id = le64_to_cpu(*(__le64 *)(raw_val));
++			struct node *child = read_node(child_id, btree, NULL);
++
++			cat_dump_node(child, out);
++			continue;
++		}
++
++		if (len < sizeof(struct apfs_key_header))
++			continue;
++		{
++			struct key curr_key;
++			read_cat_key(raw_key, len, &curr_key);
++
++			switch (curr_key.type) {
++			case APFS_TYPE_INODE: {
++				struct apfs_inode_val *val = raw_val;
++
++				if (len < 60)
++					break;
++				fprintf(out, "I\t%llu\t%u\t%llu\t%llu\t%llu\n",
++					(unsigned long long)curr_key.id,
++					(unsigned)le16_to_cpu(val->mode),
++					(unsigned long long)le64_to_cpu(val->uncompressed_size),
++					(unsigned long long)le64_to_cpu(val->create_time),
++					(unsigned long long)le64_to_cpu(val->mod_time));
++				break;
++			}
++			case APFS_TYPE_DIR_REC: {
++				struct apfs_drec_val *val = raw_val;
++				const char *name;
++				int namelen;
++
++				if (len < sizeof(*val))
++					break;
++				if (apfs_is_normalization_insensitive()) {
++					struct apfs_drec_hashed_key *hkey = raw_key;
++					name = (const char *)hkey->name;
++					namelen = le32_to_cpu(hkey->name_len_and_hash) & 0x3FFU;
++				} else {
++					struct apfs_drec_key *ukey = raw_key;
++					name = (const char *)ukey->name;
++					namelen = le16_to_cpu(ukey->name_len);
++				}
++				if (namelen < 0 || namelen > 1024)
++					namelen = 0;
++				fprintf(out, "D\t%llu\t%llu\t%u\t",
++					(unsigned long long)curr_key.id,
++					(unsigned long long)le64_to_cpu(val->file_id),
++					(unsigned)le16_to_cpu(val->flags));
++				cat_dump_escape(out, name, namelen);
++				fputc('\n', out);
++				break;
++			}
++			case APFS_TYPE_FILE_EXTENT: {
++				struct apfs_file_extent_key *ekey = raw_key;
++				struct apfs_file_extent_val *eval = raw_val;
++
++				if (len < sizeof(*eval))
++					break;
++				fprintf(out, "E\t%llu\t%llu\t%llu\t%u\t%llu\n",
++					(unsigned long long)curr_key.id,
++					(unsigned long long)le64_to_cpu(ekey->logical_addr),
++					(unsigned long long)(le64_to_cpu(eval->len_and_flags) & APFS_FILE_EXTENT_LEN_MASK),
++					(unsigned)((le64_to_cpu(eval->len_and_flags) & APFS_FILE_EXTENT_FLAG_MASK) >> APFS_FILE_EXTENT_FLAG_SHIFT),
++					(unsigned long long)le64_to_cpu(eval->phys_block_num));
++				break;
++			}
++			default:
++				break;
++			}
++		}
++	}
++}
++
++void apfs_dump_catalog(FILE *out)
++{
++	if (!vsb || !vsb->v_cat || !vsb->v_cat->root) {
++		fprintf(stderr, "[dump] no catalog tree parsed\n");
++		return;
++	}
++	cat_dump_node(vsb->v_cat->root, out);
++	fflush(out);
++}
++
++void apfs_dump_catalog_raw(u64 root_oid)
++{
++	struct btree fake;
++	FILE *out;
++	struct node *root;
++
++	out = fopen(getenv("APFS_DUMP"), "w");
++	if (!out)
++		system_error();
++	memset(&fake, 0, sizeof(fake));
++	fake.type = BTREE_TYPE_CATALOG;
++	fake.omap_table = vsb->v_omap_table;
++	root = read_node(root_oid, &fake, NULL);
++	cat_dump_node(root, out);
++	fclose(out);
++}
+diff --git a/apfsck/btree.h b/apfsck/btree.h
+index 2f54f40..57f1c1c 100644
+--- a/apfsck/btree.h
++++ b/apfsck/btree.h
+@@ -5,6 +5,7 @@
+ #ifndef _BTREE_H
+ #define _BTREE_H
+ 
++#include <stdio.h>
+ #include <apfs/raw.h>
+ #include <apfs/types.h>
+ #include "htable.h"
+@@ -231,6 +232,8 @@ extern struct node *omap_read_node(u64 id);
+ extern void free_omap_table(struct htable_entry **table);
+ extern struct omap_record *get_latest_omap_record(u64 oid, u64 xid, struct htable_entry **table);
+ extern void extentref_update_lookup(u64 bno, struct extref_record *extref);
++extern void apfs_dump_catalog(FILE *out);	/* data-recovery catalog dumpers */
++extern void apfs_dump_catalog_raw(u64 root_oid);	/* skip fsck tree checks */
+ extern int fext_tree_lookup(u64 oid, u64 logaddr, u64 *bno);
+ extern int file_extent_lookup(u64 oid, u64 logaddr, u64 *bno);
+ extern void omap_htable_clear_seen_for_snap(struct htable_entry **table);
+diff --git a/apfsck/inode.c b/apfsck/inode.c
+index 7ee9d24..2b93373 100644
+--- a/apfsck/inode.c
++++ b/apfsck/inode.c
+@@ -459,7 +459,7 @@ static int read_dstream_xfield(char *xval, int len, struct inode *inode)
+ 		 * to work, but it's very common (TODO).
+ 		 */
+ 		if (crypid == APFS_UNASSIGNED_CRYPTO_ID) {
+-			if (!(inode->i_flags & APFS_INODE_WAS_CLONED))
++			if (!(inode->i_flags & APFS_INODE_WAS_CLONED) && !apfs_recovery_mode)
+ 				report("Dstream xfield", "not a clone but has unassigned crypto.");
+ 		} else {
+ 			struct crypto_state *crypto = get_crypto_state(crypid);
+@@ -797,7 +797,7 @@ static void check_inode_internal_flags(u64 flags, u64 ino)
+ 	if (flags & APFS_INODE_IS_APFS_PRIVATE)
+ 		report_unknown("Private implementation inode");
+ 
+-	if (flags & APFS_INODE_WAS_CLONED && !(flags & APFS_INODE_WAS_EVER_CLONED)) {
++	if (!apfs_recovery_mode && flags & APFS_INODE_WAS_CLONED && !(flags & APFS_INODE_WAS_EVER_CLONED)) {
+ 		if (ino_after_cloneinfo_epoch(ino))
+ 			report("Inode record", "inconsistent clone flags.");
+ 		else
+@@ -922,7 +922,7 @@ void parse_inode_record(struct apfs_inode_key *key,
+ 
+ 	inode->i_flags = le64_to_cpu(val->internal_flags);
+ 	check_inode_internal_flags(inode->i_flags, inode->i_ino);
+-	if (inode->i_ino != inode->i_private_id && !(inode->i_flags & (APFS_INODE_WAS_CLONED | APFS_INODE_WAS_EVER_CLONED)))
++	if (!apfs_recovery_mode && inode->i_ino != inode->i_private_id && !(inode->i_flags & (APFS_INODE_WAS_CLONED | APFS_INODE_WAS_EVER_CLONED)))
+ 		report("Inode record", "not a clone but changed private id.");
+ 
+ 	def_prot_class = le32_to_cpu(val->default_protection_class);
+diff --git a/apfsck/key.c b/apfsck/key.c
+index fdd09b6..0027105 100644
+--- a/apfsck/key.c
++++ b/apfsck/key.c
+@@ -121,13 +121,15 @@ static void read_dir_rec_key(void *raw, int size, struct key *key)
+ 	bool hashed = apfs_is_normalization_insensitive();
+ 	int namelen;
+ 
+-	if (hashed && size < sizeof(struct apfs_drec_hashed_key) + 1)
+-		report("Hashed directory record", "wrong size of key.");
+-	if (!hashed && size < sizeof(struct apfs_drec_key) + 1)
+-		report("Unhashed directory record", "wrong size of key.");
+-
+-	if (*((char *)raw + size - 1) != 0)
+-		report("Directory record", "filename lacks NULL-termination.");
++	if (!apfs_recovery_mode) {
++		if (hashed && size < sizeof(struct apfs_drec_hashed_key) + 1)
++			report("Hashed directory record", "wrong size of key.");
++		if (!hashed && size < sizeof(struct apfs_drec_key) + 1)
++			report("Unhashed directory record", "wrong size of key.");
++
++		if (*((char *)raw + size - 1) != 0)
++			report("Directory record", "filename lacks NULL-termination.");
++	}
+ 
+ 	if (hashed) {
+ 		struct apfs_drec_hashed_key *raw_key = raw;
+@@ -135,10 +137,10 @@ static void read_dir_rec_key(void *raw, int size, struct key *key)
+ 		/* The filename length is ignored for the ordering, so mask it away */
+ 		key->number = le32_to_cpu(raw_key->name_len_and_hash) & ~0x3FFU;
+ 		key->name = (char *)raw_key->name;
+-		if (key->number != dentry_hash(key->name))
++		if (!apfs_recovery_mode && key->number != dentry_hash(key->name))
+ 			report("Directory record", "filename hash is corrupted.");
+ 		namelen = le32_to_cpu(raw_key->name_len_and_hash) & 0x3FFU;
+-		if (size != sizeof(*raw_key) + namelen) {
++		if (!apfs_recovery_mode && size != sizeof(*raw_key) + namelen) {
+ 			report("Hashed directory record",
+ 			       "size of key doesn't match the name length.");
+ 		}
+@@ -148,17 +150,17 @@ static void read_dir_rec_key(void *raw, int size, struct key *key)
+ 		key->number = 0;
+ 		key->name = (char *)raw_key->name;
+ 		namelen = le16_to_cpu(raw_key->name_len);
+-		if (size != sizeof(*raw_key) + namelen) {
++		if (!apfs_recovery_mode && size != sizeof(*raw_key) + namelen) {
+ 			report("Unhashed directory record",
+ 			       "size of key doesn't match the name length.");
+ 		}
+ 	}
+ 
+-	if (namelen > 256) {
++	if (!apfs_recovery_mode && namelen > 256) {
+ 		/* The name must fit in name_buf from parse_subtree() */
+ 		report("Directory record", "name is too long.");
+ 	}
+-	if (strlen(key->name) + 1 != namelen) {
++	if (!apfs_recovery_mode && strlen(key->name) + 1 != namelen) {
+ 		/* APFS counts the NULL termination for the filename length */
+ 		report("Directory record", "wrong name length in key.");
+ 	}
+@@ -324,26 +326,32 @@ void read_cat_key(void *raw, int size, struct key *key)
+ 		read_dir_rec_key(raw, size, key);
+ 		return;
+ 	case APFS_TYPE_XATTR:
++		if (apfs_recovery_mode) { key->number = 0; key->name = NULL; return; }
+ 		read_xattr_key(raw, size, key);
+ 		return;
+ 	case APFS_TYPE_FILE_EXTENT:
++		if (apfs_recovery_mode) { key->number = 0; key->name = NULL; return; }
+ 		read_file_extent_key(raw, size, key);
+ 		return;
+ 	case APFS_TYPE_FILE_INFO:
++		if (apfs_recovery_mode) { key->number = 0; key->name = NULL; return; }
+ 		read_file_info_key(raw, size, key);
+ 		return;
+ 	case APFS_TYPE_SIBLING_LINK:
++		if (apfs_recovery_mode) { key->number = 0; key->name = NULL; return; }
+ 		read_sibling_link_key(raw, size, key);
+ 		return;
+ 	case APFS_TYPE_EXTENT:
+ 		report("Catalog tree", "has extent reference record.");
+ 	case APFS_TYPE_SNAP_METADATA:
++		if (apfs_recovery_mode) { key->number = 0; key->name = NULL; return; }
+ 		report("Catalog tree", "has snapshot metadata record.");
+ 	case APFS_TYPE_SNAP_NAME:
++		if (apfs_recovery_mode) { key->number = 0; key->name = NULL; return; }
+ 		report("Catalog tree", "has snapshot name record.");
+ 	default:
+ 		/* All other key types are just the header */
+-		if (size != sizeof(struct apfs_key_header))
++		if (!apfs_recovery_mode && size != sizeof(struct apfs_key_header))
+ 			report("Catalog tree record", "wrong size of key.");
+ 		key->number = 0;
+ 		key->name = NULL;
+diff --git a/apfsck/object.c b/apfsck/object.c
+index ecbe339..94a12b7 100644
+--- a/apfsck/object.c
++++ b/apfsck/object.c
+@@ -123,7 +123,7 @@ static void *read_object_internal(u64 oid, struct htable_entry **omap_table, str
+ 			report("Object map", "record missing for id 0x%llx.", (unsigned long long)oid);
+ 		if ((bool)(omap_rec->flags & APFS_OMAP_VAL_NOHEADER) != noheader)
+ 			report("Object map", "wrong setting for noheader flag.");
+-		if (!ongoing_query) {
++		if (!ongoing_query && !apfs_recovery_mode) {
+ 			/* Query code will revisit already parsed nodes */
+ 			if (vsb && vsb->v_in_snapshot) {
+ 				if (omap_rec->seen_for_snap)
+diff --git a/apfsck/super.c b/apfsck/super.c
+index 317da81..9d419cd 100644
+--- a/apfsck/super.c
++++ b/apfsck/super.c
+@@ -64,10 +64,28 @@ static inline unsigned int blksize_bits(unsigned int size)
+  *
+  * Sets sb->s_blocksize and returns a pointer to the raw superblock in memory.
+  */
++/*
++ * Data-recovery extension: override the container superblock location.
++ *
++ * In some damaged images the standard NXSB copy at APFS_NX_BLOCK_NUM has been
++ * overwritten (e.g. by another filesystem's quick format) while valid copies
++ * of a newer NXSB survive elsewhere in the image.  Set APFS_SB_BLOCK to the
++ * block number of such a copy (decimal or 0x-prefixed hex) to read it instead.
++ */
++static u64 sb_block_override(void)
++{
++	const char *env = getenv("APFS_SB_BLOCK");
++
++	if (!env || !*env)
++		return APFS_NX_BLOCK_NUM;
++	return strtoull(env, NULL, 0);
++}
++
+ static struct apfs_nx_superblock *read_super_copy(void)
+ {
+ 	struct apfs_nx_superblock *msb_raw;
+ 	int bsize_tmp;
++	u64 sb_bno = sb_block_override();
+ 
+ 	/*
+ 	 * For now assume a small blocksize, we only need it so that we can
+@@ -76,7 +94,7 @@ static struct apfs_nx_superblock *read_super_copy(void)
+ 	bsize_tmp = APFS_NX_DEFAULT_BLOCK_SIZE;
+ 
+ 	msb_raw = mmap(NULL, bsize_tmp, PROT_READ, MAP_PRIVATE,
+-		       fd_main, APFS_NX_BLOCK_NUM * bsize_tmp);
++		       fd_main, sb_bno * bsize_tmp);
+ 	if (msb_raw == MAP_FAILED)
+ 		system_error();
+ 
+@@ -90,7 +108,7 @@ static struct apfs_nx_superblock *read_super_copy(void)
+ 		munmap(msb_raw, bsize_tmp);
+ 
+ 		msb_raw = mmap(NULL, sb->s_blocksize, PROT_READ, MAP_PRIVATE,
+-			       fd_main, APFS_NX_BLOCK_NUM * sb->s_blocksize);
++			       fd_main, sb_bno * sb->s_blocksize);
+ 		if (msb_raw == MAP_FAILED)
+ 			system_error();
+ 	}
+@@ -1087,6 +1105,20 @@ void check_volume_super(void)
+ 	if (!vsb->v_in_snapshot) {
+ 		vsb->v_omap = parse_omap_btree(vsb->v_omap_oid);
+ 		vsb->v_snap_meta = parse_snap_meta_btree(vsb->v_snap_meta_oid);
++
++		/* Data-recovery extension: stream the catalog tree to $APFS_DUMP
++		 * and exit, skipping the remaining fsck checks. */
++		{
++			const char *df = getenv("APFS_DUMP");
++			const char *dx = getenv("APFS_DUMP_XID");
++			if (df && *df && (!dx || sb->s_xid == strtoull(dx, NULL, 0))) {
++				fprintf(stderr, "[dump] xid=%llu vol=%.64s -> %s\n",
++					(unsigned long long)sb->s_xid,
++					vsb_raw->apfs_volname, df);
++				apfs_dump_catalog_raw(le64_to_cpu(vsb_raw->apfs_root_tree_oid));
++				exit(0);
++			}
++		}
+ 	}
+ 
+ 	/* A virtual object, so it must be parsed after the omap */
+@@ -1263,8 +1295,15 @@ static void parse_main_super(struct super_block *sb)
+ 		report("Container superblock", "reports no block count.");
+ 	sb->s_max_main_blkcnt = get_main_device_size(sb->s_blocksize);
+ 	sb->s_max_tier2_blkcnt = get_tier2_device_size(sb->s_blocksize);
+-	if (sb->s_block_count > sb->s_max_main_blkcnt + sb->s_max_tier2_blkcnt)
+-		report("Container superblock", "too many blocks for device.");
++	if (sb->s_block_count > sb->s_max_main_blkcnt + sb->s_max_tier2_blkcnt) {
++		if (getenv("APFS_ALLOW_TRUNCATED")) {
++			fprintf(stderr, "[warn] image truncated: SB says %llu blocks, device has %llu; clamping.\n",
++				(unsigned long long)sb->s_block_count,
++				(unsigned long long)(sb->s_max_main_blkcnt + sb->s_max_tier2_blkcnt));
++			sb->s_block_count = sb->s_max_main_blkcnt + sb->s_max_tier2_blkcnt;
++		} else
++			report("Container superblock", "too many blocks for device.");
++	}
+ 
+ 	/*
+ 	 * A chunk is the disk section covered by a single block in the
+@@ -1502,6 +1541,10 @@ static void preread_checkpoint_info(struct apfs_nx_superblock *nx_sb_copy, struc
+ 	info->data_index = le32_to_cpu(msb_raw_latest->nx_xp_data_index);
+ 	if (info->data_next >= info->data_blocks || info->data_index >= info->data_blocks)
+ 		report("Checkpoint superblock", "out of range checkpoint data.");
++	{ const char *fi=getenv("APFS_FORCE_DESC_INDEX"), *fn=getenv("APFS_FORCE_DESC_NEXT");
++	  if (fi) { info->desc_index = strtoul(fi,NULL,0);
++	    fprintf(stderr,"[force] desc_base=%u blocks=%u index=%u\n", (unsigned)info->desc_base,(unsigned)info->desc_blocks,(unsigned)info->desc_index); }
++	  if (fn) { info->desc_next = strtoul(fn,NULL,0); } }
+ 	info->desc_len = le32_to_cpu(msb_raw_latest->nx_xp_desc_len);
+ 	info->data_len = le32_to_cpu(msb_raw_latest->nx_xp_data_len);
+ 	munmap(msb_raw_latest, sb->s_blocksize);
+diff --git a/compat/linux/fs.h b/compat/linux/fs.h
+new file mode 100644
+index 0000000..b00e89f
+--- /dev/null
++++ b/compat/linux/fs.h
+@@ -0,0 +1,14 @@
++/* macOS compat shim: linux/fs.h is only needed for BLKGETSIZE64, which is
++ * never reached for regular image files (fstat path handles it). Fork-local. */
++#ifndef _COMPAT_LINUX_FS_H
++#define _COMPAT_LINUX_FS_H
++
++#include <sys/ioctl.h>
++
++/* Never reached for regular image files (fstat path handles them), but the
++ * symbol must exist to compile. */
++#ifndef BLKGETSIZE64
++#define BLKGETSIZE64 _IOR(0x12, 114, size_t)
++#endif
++
++#endif /* _COMPAT_LINUX_FS_H */
+diff --git a/compat/linux/types.h b/compat/linux/types.h
+new file mode 100644
+index 0000000..e52203b
+--- /dev/null
++++ b/compat/linux/types.h
+@@ -0,0 +1,18 @@
++/* macOS compat shim: minimal linux/types.h for apfsprogs (host is LE, so
++ * endian casts in types.h are identity anyway). Fork-local patch. */
++#ifndef _COMPAT_LINUX_TYPES_H
++#define _COMPAT_LINUX_TYPES_H
++
++#include <stdint.h>
++#include <sys/types.h> /* off_t for loff_t */
++
++typedef uint16_t __le16;
++typedef uint32_t __le32;
++typedef uint64_t __le64;
++typedef uint16_t __be16;
++typedef uint32_t __be32;
++typedef uint64_t __be64;
++
++typedef off_t loff_t;
++
++#endif /* _COMPAT_LINUX_TYPES_H */
+diff --git a/compat/mmap_shim.h b/compat/mmap_shim.h
+new file mode 100644
+index 0000000..c8e72bd
+--- /dev/null
++++ b/compat/mmap_shim.h
+@@ -0,0 +1,52 @@
++/* Fork-local macOS compat (data recovery): macOS APFS returns EINVAL from
++ * mmap() for pages inside sparse-file holes, while pread() reads them fine as
++ * zeros. Replace all file-backed mmap in apfsck TUs with calloc+pread.
++ * Included via -include before every TU's own headers; pulls sys/mman.h in
++ * first so the real prototypes are declared before the macros redefine them.
++ * NOTE: read-only use only — writes to "mapped" buffers become local copies. */
++#ifndef _COMPAT_MMAP_SHIM_H
++#define _COMPAT_MMAP_SHIM_H
++#ifdef __APPLE__
++
++#include <sys/mman.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++
++static inline void *apfs_mmap_shim(void *addr, size_t len, int prot, int flags, int fd, off_t off)
++{
++	void *buf;
++	ssize_t got;
++
++	(void)addr; (void)prot;
++	if (len == 0) { errno = EINVAL; return MAP_FAILED; }
++
++	if ((flags & MAP_ANON) != 0 || fd < 0) { /* anonymous scratch */
++		buf = calloc(1, len);
++		return buf ? buf : MAP_FAILED;
++	}
++
++	buf = calloc(1, len);
++	if (!buf) { errno = ENOMEM; return MAP_FAILED; }
++	got = pread(fd, buf, len, off);
++	if (got < 0) {
++		free(buf);
++		return MAP_FAILED;
++	}
++	/* Short read past EOF: rest stays zero. */
++	return buf;
++}
++
++static inline int apfs_munmap_shim(void *p, size_t len)
++{
++	(void)len;
++	free(p);
++	return 0;
++}
++
++#define mmap(a, l, p, f, fd, o) apfs_mmap_shim((a), (l), (p), (f), (fd), (o))
++#define munmap(p, l)             apfs_munmap_shim((p), (l))
++
++#endif /* __APPLE__ */
++#endif /* _COMPAT_MMAP_SHIM_H */

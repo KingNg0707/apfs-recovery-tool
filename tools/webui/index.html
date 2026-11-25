@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0 -->
+<!-- APFS recovery GUI front-end. Served by tools/recover_gui.py; all runtime
+     facts (image name, root totals, forbidden volumes) come from the API —
+     nothing here is hardcoded to a specific machine or disk. -->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>APFS Recovery</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--line:#262b36;--fg:#c9d1d9;--dim:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+*{box-sizing:border-box}
+body{margin:0;font:13px/1.5 "SF Pro Text","PingFang SC",system-ui,sans-serif;background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column}
+header{padding:10px 16px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:center}
+header h1{font-size:15px;margin:0;font-weight:600}
+main{flex:1;display:grid;grid-template-columns:1fr 540px;min-height:0}
+#tree{overflow:auto;padding:8px 12px;border-right:1px solid var(--line)}
+.side{padding:12px;overflow:auto}
+.node{display:flex;align-items:center;gap:6px;padding:2px 0;cursor:pointer}
+.node .tw{width:16px;text-align:center;color:var(--dim);user-select:none}
+.node .nm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node .sz{color:var(--dim);font-variant-numeric:tabular-nums;font-size:12px;white-space:nowrap}
+.node.dir .nm{color:#e6edf3;font-weight:500}
+.children{margin-left:18px;border-left:1px solid var(--line);padding-left:4px}
+input[type=checkbox]{accent-color:var(--acc)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:12px}
+.card h3{margin:0 0 8px;font-size:12px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:4px}
+.bar>i{display:block;height:100%;background:var(--acc)}
+.tgt{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed var(--line)}
+.tgt .p{flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+button{background:#21262d;border:1px solid #30363d;color:var(--fg);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px}
+button:hover{border-color:var(--acc)}
+button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+button.danger{color:var(--bad)}
+select,input[type=text],input[type=number]{background:#0d1117;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:4px 6px;font-size:12px}
+#log{font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);height:180px;overflow:auto;background:#0d1117;border-radius:6px;padding:6px;white-space:pre-wrap}
+.kv{display:flex;justify-content:space-between;font-size:12px;padding:2px 0}
+.kv b{font-variant-numeric:tabular-nums}
+.hint{color:var(--dim);font-size:11px;margin-top:4px}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="t_title">APFS 数据恢复浏览器</h1>
+  <span class="hint" id="hdrInfo"></span>
+  <button id="langBtn" style="margin-left:auto">English</button>
+</header>
+<main>
+  <div id="tree"></div>
+  <div class="side">
+    <div class="card">
+      <h3 data-i18n="selCard">已选内容</h3>
+      <div class="kv"><span data-i18n="selCountL">目录/文件数</span><b id="selCount">0</b></div>
+      <div class="kv"><span data-i18n="selBytesL">预估体积</span><b id="selBytes">0 B</b></div>
+      <div class="hint" data-i18n="selHint">勾选目录 = 其下全部内容（含已展开部分自动去重）</div>
+    </div>
+    <div class="card">
+      <h3 data-i18n="tgtCard">输出设备（按顺序填充）</h3>
+      <div id="tgts"></div>
+      <div style="display:flex;gap:6px;margin-top:8px">
+        <select id="volSel" style="flex:1"></select>
+        <input type="number" id="capGB" placeholder="上限GB" style="width:100px" min="0">
+        <button onclick="addTgt()" data-i18n="addBtn">添加</button>
+      </div>
+      <div class="hint" id="tgtHint"></div>
+    </div>
+    <div class="card">
+      <h3 data-i18n="runCard">执行</h3>
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <button class="primary" onclick="start()" data-i18n="startBtn">开始恢复</button>
+        <button class="danger" onclick="stop()" data-i18n="stopBtn">停止</button>
+      </div>
+      <div class="kv"><span data-i18n="progL">进度</span><b id="prog">–</b></div>
+      <div class="bar"><i id="pbar" style="width:0%"></i></div>
+      <div id="log" style="margin-top:8px"></div>
+    </div>
+  </div>
+</main>
+<script>
+const sel = new Set();          // selected cnids (explicit checks)
+const childrenCache = {};
+let CFG = null;                 // from /api/config
+let volumes = [];
+
+const I18N = {
+  zh: { title:"APFS 数据恢复浏览器", imgL:"镜像", rootPrefix:"只读源 · 共", selCard:"已选内容",
+        selCountL:"目录/文件数", selBytesL:"预估体积", selHint:"勾选目录 = 其下全部内容（自动去重）",
+        tgtCard:"输出设备（按顺序填充）", addBtn:"添加", startBtn:"开始恢复", stopBtn:"停止", progL:"进度",
+        freePre:"空闲", forbidden:"禁止写入", inclSubtree:"（含子树）",
+        items:"项", done:"完成", noSel:"请先勾选要恢复的文件/目录", noTgt:"请添加至少一个输出设备",
+        tgtHintBase:"空间不足自动跳到下一设备。", alreadyAdded:"已添加" },
+  en: { title:"APFS Recovery Browser", imgL:"Image", rootPrefix:"read-only source, total", selCard:"Selection",
+        selCountL:"Dirs/files", selBytesL:"Estimated size", selHint:"Checking a directory selects its whole subtree (deduplicated)",
+        tgtCard:"Output devices (filled in order)", addBtn:"Add", startBtn:"Start recovery", stopBtn:"Stop", progL:"Progress",
+        freePre:"free", forbidden:"forbidden", inclSubtree:"(incl. subtrees)",
+        items:"items", done:"done", noSel:"Select files/directories to recover first", noTgt:"Add at least one output device",
+        tgtHintBase:"When a device fills up, the next one is used.", alreadyAdded:"already added" }
+};
+let lang = "zh";
+const T = () => I18N[lang];
+
+function fmt(n){
+  if(n===undefined||n===null) return '';
+  const u=['B','KB','MB','GB','TB'];let i=0;
+  while(n>=1024&&i<u.length-1){n/=1024;i++;}
+  return n.toFixed(i?1:0)+' '+u[i];
+}
+function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function api(p,q){const r=await fetch(p+(q?('?'+new URLSearchParams(q)):''));return r.json();}
+
+function subtreeBytes(c){return c.type==='dir'?c.subtree_size:c.size;}
+function subtreeFiles(c){return c.type==='dir'?c.subtree_files:1;}
+
+// forbidden = image's own volume + any --forbid prefixes passed to the server
+function isForbidden(p){
+  return (CFG.forbidden||[]).some(f => p===f || p.startsWith(f+'/'));
+}
+
+function applyLabels(){
+  document.documentElement.lang = lang;
+  document.getElementById('t_title').textContent = T().title;
+  document.getElementById('langBtn').textContent = lang==='zh' ? 'English' : '中文';
+  document.querySelectorAll('[data-i18n]').forEach(el => el.textContent = T()[el.dataset.i18n]);
+  const cap = document.getElementById('capGB');
+  cap.placeholder = lang==='zh' ? '上限GB' : 'cap GB';
+  updateHdr(); renderTgts(); renderVols();
+}
+document.getElementById('langBtn').onclick = () => { lang = lang==='zh'?'en':'zh'; applyLabels(); };
+
+function updateHdr(){
+  const el = document.getElementById('tgtHint');
+  let base = T().tgtHintBase;
+  if(CFG){
+    const imgName = CFG.image.split('/').pop();
+    document.getElementById('hdrInfo').textContent = `${T().imgL} ${imgName} · ${T().rootPrefix} ` + (window._rootTxt||'');
+    base += ' ' + (lang==='zh' ? '源盘所在卷与 --forbid 前缀已被禁用。' : 'The source volume and --forbid prefixes are disabled.');
+  }
+  el.textContent = base;
+}
+
+async function renderRoot(){
+  const kids=await api('/api/children',{cnid:2});
+  childrenCache[2]=kids;
+  const t=document.getElementById('tree');t.innerHTML='';
+  for(const c of kids) t.appendChild(row(c));
+}
+
+function row(c){
+  const d=document.createElement('div');
+  d.dataset.cnid=c.cnid;
+  const line=document.createElement('div');line.className='node '+(c.type==='dir'?'dir':'file');
+  const tw=document.createElement('span');tw.className='tw';tw.textContent=c.children_count>0?'+':'';
+  const cb=document.createElement('input');cb.type='checkbox';cb.checked=sel.has(c.cnid);
+  cb.onclick=e=>{e.stopPropagation();toggle(c,cb);};
+  const nm=document.createElement('span');nm.className='nm';
+  nm.title=c.type==='dir'&&c.children_count?c.name+'（'+c.children_count.toLocaleString()+' '+T().items+'）':c.name;
+  nm.textContent=(c.type==='dir'?'📁 ':'📄 ')+esc(c.name);
+  const sz=document.createElement('span');sz.className='sz';sz.textContent=fmt(subtreeBytes(c));
+  line.append(tw,cb,nm,sz);d.appendChild(line);
+  if(c.children_count>0){tw.onclick=e=>{e.stopPropagation();expand(d,c,tw);};}
+  return d;
+}
+
+async function expand(d,c,tw){
+  let box=d.querySelector('.children');
+  if(box){box.style.display=box.style.display==='none'?'':'none';tw.textContent=box.style.display==='none'?'+':'−';return;}
+  const kids=await api('/api/children',{cnid:c.cnid});
+  childrenCache[c.cnid]=kids;
+  box=document.createElement('div');box.className='children';
+  for(const k of kids) box.appendChild(row(k));
+  d.appendChild(box);tw.textContent='−';
+}
+
+function toggle(c,cb){
+  if(cb.checked){sel.add(c.cnid);}else{sel.delete(c.cnid);}
+  computeSel();
+}
+
+async function computeSel(){
+  let cnt=sel.size, bytes=0;
+  const miss=[];
+  for(const cnid of sel){
+    const c=findInCache(cnid);
+    if(c) bytes+=subtreeBytes(c); else miss.push(cnid);
+  }
+  for(const m of miss){
+    const n=await api('/api/node',{cnid:m});
+    if(n){childrenCache['_'+m]=n;bytes+=(n.type==='dir'?n.subtree_size:n.size);}
+  }
+  document.getElementById('selCount').textContent=cnt.toLocaleString();
+  document.getElementById('selBytes').textContent=fmt(bytes)+' '+T().inclSubtree;
+}
+function findInCache(cnid){
+  for(const k in childrenCache) for(const c of childrenCache[k]) if(c.cnid===cnid) return c;
+  return null;
+}
+
+// ---- targets & volumes
+let targets=[];
+function renderVols(){
+  const s=document.getElementById('volSel');s.innerHTML='';
+  for(const x of volumes){
+    const o=document.createElement('option');o.value=x.path;
+    let label=`${x.path}（${T().freePre} ${fmt(x.free)}）`;
+    if(lang==='en') label=`${x.path} (${T().freePre} ${fmt(x.free)})`;
+    if(isForbidden(x.path)){o.disabled=true;o.textContent=label+' · '+T().forbidden;}
+    else o.textContent=label;
+    s.appendChild(o);
+  }
+}
+async function loadVols(){
+  volumes = await api('/api/volumes');
+  renderVols();
+}
+async function addTgt(){
+  const p=document.getElementById('volSel').value;
+  if(!p) return;
+  if(isForbidden(p)) return alert(T().forbidden);
+  if(targets.some(t=>t.path===p)) return alert(T().alreadyAdded);
+  const cap=parseFloat(document.getElementById('capGB').value||0)*1e9;
+  targets.push({path:p,cap:Math.round(cap)});
+  document.getElementById('capGB').value='';
+  renderTgts();
+}
+function renderTgts(){
+  const box=document.getElementById('tgts');box.innerHTML='';
+  targets.forEach((t,i)=>{
+    const d=document.createElement('div');d.className='tgt';
+    const capTxt = t.cap ? (lang==='zh'?'（上限 ':' (cap ') + fmt(t.cap) + '）') : '';
+    d.innerHTML=`<span class="p" title="${esc(t.path)}">${i+1}. ${esc(t.path)}${capTxt}</span><button onclick="rmTgt(${i})">✕</button>`;
+    box.appendChild(d);
+  });
+}
+function rmTgt(i){targets.splice(i,1);renderTgts();}
+
+// ---- run & poll
+async function start(){
+  const cnids=[...sel];
+  if(!cnids.length) return alert(T().noSel);
+  if(!targets.length) return alert(T().noTgt);
+  const res=await fetch('/api/extract',{method:'POST',body:JSON.stringify({cnids,targets})});
+  const j=await res.json();
+  if(!j.ok) alert(j.error);
+}
+async function stop(){await fetch('/api/stop',{method:'POST'});}
+
+async function poll(){
+  try{
+    const s=await api('/api/status');
+    document.getElementById('prog').textContent=s.running?`${s.done}/${s.total_files} · ${fmt(s.bytes_done)}`:`${s.done}/${s.total_files} ${T().done}`;
+    const pct=s.total_bytes?Math.min(100,s.bytes_done/s.total_bytes*100):(s.total_files?s.done/s.total_files*100:0);
+    document.getElementById('pbar').style.width=pct+'%';
+    document.getElementById('log').textContent=s.log.join('\n');
+    document.getElementById('log').scrollTop=1e9;
+  }catch(e){}
+}
+
+(async()=>{
+  CFG = await api('/api/config');
+  const root=await api('/api/node',{cnid:2});
+  window._rootTxt=`${(root.subtree_files||0).toLocaleString()} files / ${fmt(root.subtree_size)}`;
+  applyLabels();
+  renderRoot();loadVols();setInterval(poll,2000);poll();
+})();
+</script>
+</body>
+</html>
